@@ -23,75 +23,83 @@ app.get('/health', (req, res) => {
 });
 
 // OCR endpoint
-app.post('/api/ocr', upload.single('file'), async (req, res) => {
+const AZURE_DI_ENDPOINT = process.env.AZURE_DI_ENDPOINT;
+const AZURE_DI_KEY = process.env.AZURE_DI_KEY;
+const AZURE_API_VERSION = "2024-11-30";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+app.post("/api/ocr", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+    if (!AZURE_DI_ENDPOINT || !AZURE_DI_KEY) {
+      return res.status(500).json({ error: "Missing Azure DI env vars" });
+    }
+    if (!req.file?.buffer) {
+      return res.status(400).json({ error: "No file uploaded" });
     }
 
-    console.log(`Processing file: ${req.file.originalname}, Size: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`);
+    const endpoint = AZURE_DI_ENDPOINT.replace(/\/$/, "");
+    const submitUrl =
+      `${endpoint}/documentintelligence/documentModels/prebuilt-read:analyze` +
+      `?api-version=${AZURE_API_VERSION}`;
 
-    // Create form data for OCR.space
-    const formData = new FormData();
-    formData.append('file', req.file.buffer, {
-      filename: req.file.originalname,
-      contentType: req.file.mimetype
-    });
-    formData.append('language', 'por,eng,spa');
-    formData.append('isOverlayRequired', 'false');
-    formData.append('detectOrientation', 'true');
-    formData.append('scale', 'true');
-    formData.append('OCREngine', '2');
-
-    // Call OCR.space API
-    const ocrResponse = await fetch('https://api.ocr.space/parse/image', {
-      method: 'POST',
-      body: formData,
-      headers: formData.getHeaders()
+    // 1) Submit (returns 202 + operation-location)
+    const submitResp = await fetch(submitUrl, {
+      method: "POST",
+      headers: {
+        "Ocp-Apim-Subscription-Key": AZURE_DI_KEY,
+        "Content-Type": req.file.mimetype || "application/pdf",
+      },
+      body: req.file.buffer,
     });
 
-    if (!ocrResponse.ok) {
-      throw new Error(`OCR API error: ${ocrResponse.status}`);
-    }
-
-    const ocrData = await ocrResponse.json();
-
-    if (ocrData.IsErroredOnProcessing) {
-      throw new Error(ocrData.ErrorMessage?.[0] || 'OCR processing failed');
-    }
-
-    // Extract text from OCR results
-    let extractedText = '';
-    if (ocrData.ParsedResults && ocrData.ParsedResults.length > 0) {
-      ocrData.ParsedResults.forEach((result, index) => {
-        if (result.ParsedText) {
-          extractedText += `Page ${index + 1}:\n${result.ParsedText}\n\n`;
-        }
+    if (submitResp.status !== 202) {
+      const txt = await submitResp.text();
+      return res.status(500).json({
+        error: "Azure DI submit failed",
+        status: submitResp.status,
+        details: txt,
       });
     }
 
-    if (extractedText.length < 50) {
-      return res.status(400).json({ 
-        error: 'No text could be extracted from the document' 
-      });
+    const opLocation = submitResp.headers.get("operation-location");
+    if (!opLocation) {
+      return res.status(500).json({ error: "Missing Operation-Location" });
     }
 
-    console.log(`Successfully extracted ${extractedText.length} characters`);
+    // 2) Poll until succeeded
+    let finalData = null;
+    for (let i = 0; i < 30; i++) {
+      await sleep(1000);
 
-    res.json({ 
-      success: true, 
-      text: extractedText,
-      filename: req.file.originalname
-    });
+      const pollResp = await fetch(opLocation, {
+        headers: { "Ocp-Apim-Subscription-Key": AZURE_DI_KEY },
+      });
 
-  } catch (error) {
-    console.error('OCR error:', error);
-    res.status(500).json({ 
-      error: 'Failed to process document', 
-      details: error.message 
-    });
+      const data = await pollResp.json();
+
+      if (data.status === "succeeded") {
+        finalData = data;
+        break;
+      }
+      if (data.status === "failed") {
+        return res.status(500).json({ error: "Azure DI failed", details: data });
+      }
+    }
+
+    if (!finalData) {
+      return res.status(504).json({ error: "Azure DI timeout" });
+    }
+
+    const text = finalData?.analyzeResult?.content || "";
+    return res.json({ text });
+  } catch (e) {
+    return res.status(500).json({ error: "Azure DI exception", details: String(e) });
   }
 });
+
 
 // Claude API endpoint
 app.post('/api/analyze', async (req, res) => {
