@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const fetch = require('node-fetch');
-const FormData = require('form-data');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -14,43 +13,53 @@ app.use(express.json());
 // Configure multer for file uploads
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
 });
 
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Fertility MVP Backend is running' });
 });
+app.get('/debug/env', (req, res) => {
+  res.json({
+    hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+    hasAzureKey: !!process.env.AZURE_DI_KEY,
+    hasAzureEndpoint: !!process.env.AZURE_DI_ENDPOINT,
+  });
+});
 
-// OCR endpoint
+
+
+
+// ===== OCR (Azure Document Intelligence) =====
 const AZURE_DI_ENDPOINT = process.env.AZURE_DI_ENDPOINT;
 const AZURE_DI_KEY = process.env.AZURE_DI_KEY;
-const AZURE_API_VERSION = "2024-11-30";
+const AZURE_API_VERSION = '2024-11-30';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-app.post("/api/ocr", upload.single("file"), async (req, res) => {
+app.post('/api/ocr', upload.single('file'), async (req, res) => {
   try {
     if (!AZURE_DI_ENDPOINT || !AZURE_DI_KEY) {
-      return res.status(500).json({ error: "Missing Azure DI env vars" });
+      return res.status(500).json({ error: 'Missing Azure DI env vars' });
     }
     if (!req.file?.buffer) {
-      return res.status(400).json({ error: "No file uploaded" });
+      return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const endpoint = AZURE_DI_ENDPOINT.replace(/\/$/, "");
+    const endpoint = AZURE_DI_ENDPOINT.replace(/\/$/, '');
     const submitUrl =
       `${endpoint}/documentintelligence/documentModels/prebuilt-read:analyze` +
       `?api-version=${AZURE_API_VERSION}`;
 
     // 1) Submit (returns 202 + operation-location)
     const submitResp = await fetch(submitUrl, {
-      method: "POST",
+      method: 'POST',
       headers: {
-        "Ocp-Apim-Subscription-Key": AZURE_DI_KEY,
-        "Content-Type": req.file.mimetype || "application/pdf",
+        'Ocp-Apim-Subscription-Key': AZURE_DI_KEY,
+        'Content-Type': req.file.mimetype || 'application/pdf',
       },
       body: req.file.buffer,
     });
@@ -58,15 +67,15 @@ app.post("/api/ocr", upload.single("file"), async (req, res) => {
     if (submitResp.status !== 202) {
       const txt = await submitResp.text();
       return res.status(500).json({
-        error: "Azure DI submit failed",
+        error: 'Azure DI submit failed',
         status: submitResp.status,
         details: txt,
       });
     }
 
-    const opLocation = submitResp.headers.get("operation-location");
+    const opLocation = submitResp.headers.get('operation-location');
     if (!opLocation) {
-      return res.status(500).json({ error: "Missing Operation-Location" });
+      return res.status(500).json({ error: 'Missing Operation-Location' });
     }
 
     // 2) Poll until succeeded
@@ -75,38 +84,40 @@ app.post("/api/ocr", upload.single("file"), async (req, res) => {
       await sleep(1000);
 
       const pollResp = await fetch(opLocation, {
-        headers: { "Ocp-Apim-Subscription-Key": AZURE_DI_KEY },
+        headers: { 'Ocp-Apim-Subscription-Key': AZURE_DI_KEY },
       });
 
       const data = await pollResp.json();
 
-      if (data.status === "succeeded") {
+      if (data.status === 'succeeded') {
         finalData = data;
         break;
       }
-      if (data.status === "failed") {
-        return res.status(500).json({ error: "Azure DI failed", details: data });
+      if (data.status === 'failed') {
+        return res.status(500).json({ error: 'Azure DI failed', details: data });
       }
     }
 
     if (!finalData) {
-      return res.status(504).json({ error: "Azure DI timeout" });
+      return res.status(504).json({ error: 'Azure DI timeout' });
     }
 
-    const text = finalData?.analyzeResult?.content || "";
+    const text = finalData?.analyzeResult?.content || '';
     return res.json({ text });
   } catch (e) {
-    return res.status(500).json({ error: "Azure DI exception", details: String(e) });
+    return res
+      .status(500)
+      .json({ error: 'Azure DI exception', details: String(e) });
   }
 });
 
-
-// Claude API endpoint
+// ===== Analyze (Anthropic Claude) =====
 app.post('/api/analyze', async (req, res) => {
   try {
-    const { text, apiKey } = req.body;
+    const { text } = req.body;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
 
-    if (!text) {
+    if (!text || !String(text).trim()) {
       return res.status(400).json({ error: 'No text provided' });
     }
 
@@ -166,38 +177,42 @@ RULES:
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
+        'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 4096,
-        messages: [{
-          role: 'user',
-          content: `${MEDICAL_PROMPT}\n\nAnalyze the following medical document:\n\n${text}`
-        }]
-      })
+        messages: [
+          {
+            role: 'user',
+            content: `${MEDICAL_PROMPT}\n\nAnalyze the following medical document:\n\n${text}`,
+          },
+        ],
+      }),
     });
 
     if (!claudeResponse.ok) {
       const errorText = await claudeResponse.text();
-      throw new Error(`Claude API error: ${claudeResponse.status} - ${errorText}`);
+      return res.status(500).json({
+        error: 'Failed to analyze document',
+        details: `Claude API error: ${claudeResponse.status} - ${errorText}`,
+      });
     }
 
     const claudeData = await claudeResponse.json();
-    const report = claudeData.content[0].text;
+    const report = claudeData?.content?.[0]?.text ?? '';
 
     console.log('Analysis complete');
 
-    res.json({ 
-      success: true, 
-      report: report 
+    return res.json({
+      success: true,
+      report,
     });
-
   } catch (error) {
     console.error('Analysis error:', error);
-    res.status(500).json({ 
-      error: 'Failed to analyze document', 
-      details: error.message 
+    return res.status(500).json({
+      error: 'Failed to analyze document',
+      details: String(error.message || error),
     });
   }
 });
