@@ -13,7 +13,7 @@ app.use(express.json());
 // Configure multer for file uploads
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
 });
 
 // Health check endpoint
@@ -80,8 +80,8 @@ app.post('/api/ocr', upload.single('file'), async (req, res) => {
 
     // 2) Poll until succeeded
     let finalData = null;
-    for (let i = 0; i < 30; i++) {
-      await sleep(1000);
+    for (let i = 0; i < 120; i++) {
+      await sleep(1500);
 
       const pollResp = await fetch(opLocation, {
         headers: { 'Ocp-Apim-Subscription-Key': AZURE_DI_KEY },
